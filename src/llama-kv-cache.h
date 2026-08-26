@@ -4,7 +4,9 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-zram-cache.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -186,6 +188,12 @@ public:
 
     // find places for the provided ubatches in the cache, returns the slot infos
     // return empty vector on failure
+    //
+    // note: internally, prepare() takes a rollback snapshot of every cell it
+    // touches before speculatively placing each ubatch, so it can restore the
+    // cells if a later ubatch in the batch fails to find a slot. that
+    // snapshot is pure host-side metadata (never read by the compute graph)
+    // and is a dynamic cache in its own right -- see rollback_cache_reserve().
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
@@ -320,6 +328,34 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+    //
+    // rollback cache (see llama-zram-cache.h)
+    //
+    // prepare() takes a backup ("rollback snapshot") of the cells it's about
+    // to overwrite for every ubatch, purely so it can undo the speculative
+    // placement if a later ubatch in the same batch doesn't fit anywhere.
+    // that snapshot is host-only bookkeeping -- positions + per-cell sequence
+    // membership -- never touched by the GPU/CPU compute graph, unlike the
+    // actual K/V tensors (which MUST stay in a real ggml_backend_buffer for
+    // the compute kernels to read/write directly, and can never live behind
+    // a block-device interface like zram).
+    //
+    // this makes the rollback snapshot a legitimate "dynamic, non-physical,
+    // frequently-refreshed" cache: off by default (it costs real CPU time to
+    // (de)serialize on every prepare() call), opt in with:
+    //   LLAMA_KV_CACHE_ROLLBACK_ZRAM=1
+    // if zram turns out to be unavailable at runtime, prepare() transparently
+    // falls back to the original plain-RAM std::vector<llama_kv_cells> path.
+    //
+
+    std::unique_ptr<llama_dynamic_zram_cache> m_rollback_cache;
+    uint64_t                                  m_rollback_cache_next_off = 0;
+
+    // ensure the rollback cache exists and can hold at least `min_bytes`
+    // starting at offset 0. returns false if zram is unavailable (caller
+    // should fall back to the in-RAM rollback path for this prepare() call).
+    bool rollback_cache_reserve(uint64_t min_bytes);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
