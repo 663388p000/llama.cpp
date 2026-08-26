@@ -5,6 +5,7 @@
 
 #include <bitset>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <set>
@@ -453,6 +454,97 @@ public:
         seq_pos_add(i);
 
         has_shift = true;
+    }
+
+    // ------------------------------------------------------------------
+    // POD (de)serialization.
+    //
+    // Used to spill a cp()'d snapshot of cells (e.g. a rollback backup taken
+    // before speculatively placing a ubatch) to an external byte-addressable
+    // store -- such as a zram-backed dynamic cache -- instead of always
+    // keeping a second, physical copy resident in plain host RAM. This is
+    // pure host-side bookkeeping (positions + per-cell sequence membership),
+    // never touched by the GPU/CPU compute graph, which is exactly the kind
+    // of "dynamic, non-physical, frequently rewritten" data that's a good
+    // fit for that backend.
+    //
+    // Layout (packed, no padding, native host byte order -- same-process,
+    // same-run use only, not a stable on-disk format):
+    //   llama_pos          pos[n]
+    //   llama_kv_cell_ext  ext[n]
+    //   uint8_t            seq_bits[n][ceil(LLAMA_MAX_SEQ/8)]
+    //
+    // note: `shift` and the derived `used`/`seq_pos` bookkeeping are
+    // intentionally NOT serialized. cp() always produces cells with
+    // shift == 0 (asserted there), and set() -- the only consumer of a
+    // cp()'d/deserialized snapshot -- rebuilds `used`/`seq_pos` itself from
+    // pos[]/seq[] as it applies the snapshot. This matches the existing
+    // in-memory cp()/set() round-trip contract exactly.
+    // ------------------------------------------------------------------
+
+    static size_t seq_bytes_per_cell() {
+        return (LLAMA_MAX_SEQ + 7) / 8;
+    }
+
+    size_t serialized_size() const {
+        const size_t n = pos.size();
+        return n*sizeof(llama_pos) + n*sizeof(llama_kv_cell_ext) + n*seq_bytes_per_cell();
+    }
+
+    void serialize_to(void * dst) const {
+        const size_t n  = pos.size();
+        const size_t sb = seq_bytes_per_cell();
+
+        uint8_t * out = (uint8_t *) dst;
+
+        memcpy(out, pos.data(), n*sizeof(llama_pos));
+        out += n*sizeof(llama_pos);
+
+        memcpy(out, ext.data(), n*sizeof(llama_kv_cell_ext));
+        out += n*sizeof(llama_kv_cell_ext);
+
+        for (size_t i = 0; i < n; ++i) {
+            uint8_t * bits = out + i*sb;
+            memset(bits, 0, sb);
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (seq[i].test(s)) {
+                    bits[s/8] |= (uint8_t) (1u << (s%8));
+                }
+            }
+        }
+    }
+
+    // deserialize into *this -- must already be sized via resize(n) (see
+    // from_bytes() below for a convenience one-shot constructor)
+    void deserialize_from(const void * src) {
+        const size_t n  = pos.size();
+        const size_t sb = seq_bytes_per_cell();
+
+        const uint8_t * in = (const uint8_t *) src;
+
+        memcpy(pos.data(), in, n*sizeof(llama_pos));
+        in += n*sizeof(llama_pos);
+
+        memcpy(ext.data(), in, n*sizeof(llama_kv_cell_ext));
+        in += n*sizeof(llama_kv_cell_ext);
+
+        for (size_t i = 0; i < n; ++i) {
+            const uint8_t * bits = in + i*sb;
+            seq[i].reset();
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (bits[s/8] & (uint8_t) (1u << (s%8))) {
+                    seq[i].set(s);
+                }
+            }
+            shift[i] = 0;
+        }
+    }
+
+    static llama_kv_cells from_bytes(const void * src, uint32_t n) {
+        llama_kv_cells res;
+        res.resize(n);
+        res.deserialize_from(src);
+        return res;
     }
 
 private:
