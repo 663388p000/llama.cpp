@@ -746,19 +746,94 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
     return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
 }
 
+bool llama_kv_cache::rollback_cache_reserve(uint64_t min_bytes) {
+    // keep at least 1 MiB around so a string of small prepare() calls doesn't
+    // thrash device creation/teardown
+    if (min_bytes == 0) {
+        min_bytes = 1u << 20;
+    }
+
+    if (m_rollback_cache && m_rollback_cache->capacity() >= min_bytes && m_rollback_cache->is_zram_backed()) {
+        return true;
+    }
+
+    llama_dynamic_cache_config cfg;
+    cfg.capacity_bytes = min_bytes;
+    cfg.force_zram      = true;
+    cfg.debug_name       = "llama_kv_cache_rollback";
+    // snapshots here are small, extremely frequent, and read back almost
+    // immediately (worst case: a few ubatches later, same prepare() call) --
+    // O_DIRECT's alignment/bounce-buffer overhead isn't worth it for that
+    // access pattern, so keep this path on plain buffered pread/pwrite.
+    cfg.direct_io_min_bytes = 0;
+
+    m_rollback_cache = std::make_unique<llama_dynamic_zram_cache>(cfg);
+    m_rollback_cache_next_off = 0;
+
+    if (!m_rollback_cache->is_zram_backed()) {
+        LLAMA_LOG_WARN("%s: zram rollback cache unavailable, prepare() will fall back to plain RAM "
+                        "for rollback snapshots (check zram module / permissions)\n", __func__);
+        m_rollback_cache.reset();
+        return false;
+    }
+
+    return true;
+}
+
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
+
+    // Route the ephemeral rollback snapshots taken below through a zram-backed
+    // dynamic cache instead of a second, always-physical std::vector copy in
+    // plain host RAM. This is opt-in (LLAMA_KV_CACHE_ROLLBACK_ZRAM=1) because
+    // (de)serializing llama_kv_cells has a real per-call cost that isn't free
+    // just because it moved off the heap -- see llama-zram-cache.h.
+    //
+    // note: only the rollback *snapshot* goes through zram here. The actual
+    // K/V tensor data is untouched by this and stays exactly where it always
+    // was, in the real ggml_backend_buffer(s) allocated in the constructor --
+    // that memory must remain directly addressable by the compute graph and
+    // can never live behind a block-device interface like zram.
+    static const bool use_zram_rollback = [] {
+        const char * env = getenv("LLAMA_KV_CACHE_ROLLBACK_ZRAM");
+        return env && atoi(env) > 0;
+    }();
 
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
 
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
-        std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+        // exactly one of the two members below is populated per state_t,
+        // depending on whether the zram rollback path is active and healthy
+        // at the time this snapshot was taken:
+        std::vector<llama_kv_cells> v_cells;      // in-RAM path (default)
+        std::vector<uint64_t>       v_cells_zoff; // zram path: byte offset per stream
+        std::vector<uint32_t>       v_cells_zn;   // zram path: cell count per stream
     };
 
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
+
+    const bool zram_active = use_zram_rollback && !ubatches.empty() &&
+        rollback_cache_reserve([&] {
+            // worst case: every ubatch touches every stream at its max token count
+            uint64_t max_bytes = 0;
+            for (const auto & ubatch : ubatches) {
+                uint32_t n_tokens = ubatch.n_tokens;
+                if (n_stream > 1 && ubatch.n_seqs_unq > 0) {
+                    n_tokens /= ubatch.n_seqs_unq;
+                }
+                const uint64_t bytes = (uint64_t) n_tokens *
+                    (sizeof(llama_pos) + sizeof(llama_kv_cell_ext) + llama_kv_cells::seq_bytes_per_cell());
+                max_bytes = std::max(max_bytes, bytes);
+            }
+            return max_bytes * ubatches.size() * std::max<uint32_t>(1, n_stream);
+        }());
+
+    if (use_zram_rollback && !ubatches.empty()) {
+        m_rollback_cache_next_off = 0;
+    }
 
     bool success = true;
 
@@ -775,12 +850,49 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // store the old state of the cells in the recovery stack
         {
-            state_t state = { sinfo_new, v_heads, {} };
+            state_t state;
+            state.sinfo       = sinfo_new;
+            state.v_heads_old = v_heads;
 
-            for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
-                auto & cells = v_cells[sinfo_new.strm[s]];
+            bool wrote_to_zram = false;
 
-                state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
+            if (zram_active) {
+                wrote_to_zram = true;
+
+                for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
+                    auto & cells = v_cells[sinfo_new.strm[s]];
+                    const llama_kv_cells snap = cells.cp(sinfo_new.idxs[s]);
+
+                    const uint64_t off = m_rollback_cache_next_off;
+                    const uint64_t sz  = snap.serialized_size();
+
+                    std::vector<uint8_t> buf(sz);
+                    snap.serialize_to(buf.data());
+
+                    if (off + sz <= m_rollback_cache->capacity() && m_rollback_cache->write(off, buf.data(), sz)) {
+                        state.v_cells_zoff.push_back(off);
+                        state.v_cells_zn.push_back((uint32_t) sinfo_new.idxs[s].size());
+                        m_rollback_cache_next_off += sz;
+                    } else {
+                        // ran out of reserved space or hit an I/O error -- don't
+                        // fail the whole batch over a rollback-storage hiccup,
+                        // just fall back to RAM for this snapshot (and this
+                        // snapshot only; earlier/later ones are unaffected)
+                        LLAMA_LOG_WARN("%s: zram rollback cache write failed at stream %u, "
+                                        "using plain RAM for this snapshot\n", __func__, s);
+                        wrote_to_zram = false;
+                        state.v_cells_zoff.clear();
+                        state.v_cells_zn.clear();
+                        break;
+                    }
+                }
+            }
+
+            if (!wrote_to_zram) {
+                for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
+                    auto & cells = v_cells[sinfo_new.strm[s]];
+                    state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
+                }
             }
 
             states.push_back(std::move(state));
@@ -800,7 +912,24 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             auto & cells = v_cells[sinfo.strm[s]];
             auto & head  = v_heads[sinfo.strm[s]];
 
-            cells.set(sinfo.idxs[s], it->v_cells[s]);
+            if (!it->v_cells_zoff.empty()) {
+                const uint64_t off = it->v_cells_zoff[s];
+                const uint32_t n   = it->v_cells_zn[s];
+
+                const size_t sz = (size_t) n * (sizeof(llama_pos) + sizeof(llama_kv_cell_ext) + llama_kv_cells::seq_bytes_per_cell());
+
+                std::vector<uint8_t> buf(sz);
+                if (m_rollback_cache && m_rollback_cache->read(off, buf.data(), sz)) {
+                    const llama_kv_cells restored = llama_kv_cells::from_bytes(buf.data(), n);
+                    cells.set(sinfo.idxs[s], restored);
+                } else {
+                    LLAMA_LOG_ERROR("%s: failed to read back zram rollback snapshot at stream %u -- "
+                                     "cache cell metadata may now be inconsistent!\n", __func__, s);
+                }
+            } else {
+                cells.set(sinfo.idxs[s], it->v_cells[s]);
+            }
+
             head = it->v_heads_old[s];
         }
     }
